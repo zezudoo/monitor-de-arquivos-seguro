@@ -1,0 +1,10 @@
+{
+  "pastas_monitoradas": [
+    {
+      "origem": "C:\\Users\\Jose\\Desktop\\origem",
+      "destino": "C:\\Users\\Jose\\Desktop\\destino",
+      "extensoes": [".iso"]
+    }
+  ],
+  "segundos_intervalo_scan": 90
+}

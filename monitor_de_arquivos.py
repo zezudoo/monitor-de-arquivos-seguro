@@ -91,7 +91,9 @@ def arquivo_esta_estavel(caminho_arquivo: str, tentativas: int = 3, intervalo: i
         time.sleep(intervalo)
     return False
 
-def copiar_arquivo_seguro(origem: str, destino: str, logger: logging.Logger, arquivos_processados: Dict[str, float]) -> None:
+def copiar_arquivo_seguro(origem: str, destino: str, logger: logging.Logger,
+                          arquivos_processados: Dict[str, float],
+                          pasta_origem: str) -> None:
     try:
         nome_arquivo = os.path.basename(origem)
         destino_arquivo = os.path.join(destino, nome_arquivo)
@@ -123,10 +125,14 @@ def copiar_arquivo_seguro(origem: str, destino: str, logger: logging.Logger, arq
             log_evento(logger, f"Hash inválido para o arquivo: {nome_arquivo}", "warning")
             return
 
+        if hash_arquivo in arquivos_processados:
+            log_evento(logger, f"Arquivo já processado anteriormente: {nome_arquivo}")
+            return
+
         log_evento(logger, f"Iniciando transferência: {nome_arquivo}...")
         shutil.copy2(origem, destino_arquivo)
         arquivos_processados[hash_arquivo] = time.time()
-        salvar_hashes(origem, arquivos_processados)
+        salvar_hashes(pasta_origem, arquivos_processados)
         log_evento(logger, f"Arquivo copiado com sucesso: {nome_arquivo}")
 
         ARQUIVOS_TENTATIVAS_FALHA.pop(nome_arquivo, None)
@@ -147,7 +153,13 @@ def monitorar_pasta(origem: str, destino: str, intervalo: int, extensoes: Option
                     continue
                 caminho_arquivo = os.path.join(origem, nome_arquivo)
                 if os.path.isfile(caminho_arquivo):
-                    copiar_arquivo_seguro(caminho_arquivo, destino, logger, arquivos_processados)
+                    copiar_arquivo_seguro(
+                        caminho_arquivo,
+                        destino,
+                        logger,
+                        arquivos_processados,
+                        origem,
+                    )
         except Exception as e:
             log_evento(logger, f"Erro ao monitorar a pasta {origem}: {str(e)}", "error")
         time.sleep(intervalo)

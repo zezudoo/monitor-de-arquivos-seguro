@@ -123,10 +123,14 @@ def copiar_arquivo_seguro(origem: str, destino: str, logger: logging.Logger, arq
             log_evento(logger, f"Hash inválido para o arquivo: {nome_arquivo}", "warning")
             return
 
+        if hash_arquivo in arquivos_processados:
+            log_evento(logger, f"Arquivo já processado anteriormente: {nome_arquivo}", "info")
+            return
+
         log_evento(logger, f"Iniciando transferência: {nome_arquivo}...")
         shutil.copy2(origem, destino_arquivo)
         arquivos_processados[hash_arquivo] = time.time()
-        salvar_hashes(origem, arquivos_processados)
+        salvar_hashes(os.path.dirname(origem), arquivos_processados)
         log_evento(logger, f"Arquivo copiado com sucesso: {nome_arquivo}")
 
         ARQUIVOS_TENTATIVAS_FALHA.pop(nome_arquivo, None)

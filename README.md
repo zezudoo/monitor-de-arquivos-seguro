@@ -33,3 +33,16 @@ Detecta arquivos novos em pastas configuradas, verifica integridade e os copia a
   ],
   "segundos_intervalo_scan": 60
 }
+```
+
+## 🔨 Gerando executável para Windows
+
+1. Instale o [PyInstaller](https://pyinstaller.org) com:
+   ```bash
+   pip install pyinstaller
+   ```
+2. Execute na pasta do projeto:
+   ```bash
+   pyinstaller --onefile --windowed --icon monitor_icone.ico monitor_de_arquivos.py
+   ```
+3. O executável final estará em `dist/monitor_de_arquivos.exe`.

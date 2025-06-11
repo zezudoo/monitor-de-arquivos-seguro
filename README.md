@@ -17,6 +17,15 @@ Detecta arquivos novos em pastas configuradas, verifica integridade e os copia a
 - 🛑 Evita múltiplas instâncias simultâneas via `.lock`
 - 🔧 Configuração via arquivo externo `configuracao.json`
 - 📦 Empacotável como `.exe` com ícone de bandeja
+- 🖥️ Exibe janela de log em tempo real ao clicar no ícone
+
+---
+
+## 📦 Instalação de dependências
+
+```bash
+pip install -r requirements.txt
+```
 
 ---
 
@@ -46,3 +55,6 @@ Detecta arquivos novos em pastas configuradas, verifica integridade e os copia a
    pyinstaller --onefile --windowed --icon monitor_icone.ico monitor_de_arquivos.py
    ```
 3. O executável final estará em `dist/monitor_de_arquivos.exe`.
+
+Ao executar o programa, um ícone será mostrado na bandeja do sistema. Utilize o
+menu do ícone para abrir a janela de log ou encerrar a aplicação.

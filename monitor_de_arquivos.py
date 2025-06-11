@@ -7,8 +7,13 @@ import hashlib
 import logging
 import threading
 import datetime
+import queue
+import tkinter as tk
+from tkinter.scrolledtext import ScrolledText
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Any, Optional, List
+from PIL import Image
+import pystray
 
 PASTA_LOGS = "logs"
 PASTA_HASHES = "hashes"
@@ -20,6 +25,25 @@ LIMITE_TENTATIVAS = 3
 
 os.makedirs(PASTA_LOGS, exist_ok=True)
 os.makedirs(PASTA_HASHES, exist_ok=True)
+
+LOG_QUEUE: "queue.Queue[str]" = queue.Queue()
+ICON_PATH = "monitor_icone.ico"
+running = True
+
+
+class QueueLoggerHandler(logging.Handler):
+    """Envia mensagens de log para uma fila para interface."""
+
+    def __init__(self, fila: queue.Queue) -> None:
+        super().__init__()
+        self.fila = fila
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            self.fila.put(msg)
+        except Exception:
+            pass
 
 def carregar_hashes(origem: str) -> Dict[str, float]:
     nome_base = origem.replace(":", "").replace("\\", "_").replace("/", "_").strip("_")
@@ -59,6 +83,9 @@ def configurar_log(origem: str) -> logging.Logger:
         manipulador.setFormatter(formatador)
         logger.addHandler(manipulador)
         logger.addHandler(logging.StreamHandler(sys.stdout))
+        fila_handler = QueueLoggerHandler(LOG_QUEUE)
+        fila_handler.setFormatter(formatador)
+        logger.addHandler(fila_handler)
 
     return logger
 
@@ -141,12 +168,51 @@ def copiar_arquivo_seguro(origem: str, destino: str, logger: logging.Logger,
     except Exception as e:
         log_evento(logger, f"Erro ao copiar o arquivo {origem}: {str(e)}", "error")
 
+
+def mostrar_janela_log() -> None:
+    janela = tk.Tk()
+    janela.title("Log do Monitor")
+    texto = ScrolledText(janela, width=100, height=30)
+    texto.pack(fill=tk.BOTH, expand=True)
+
+    def atualizar() -> None:
+        while not LOG_QUEUE.empty():
+            msg = LOG_QUEUE.get()
+            texto.insert(tk.END, msg + "\n")
+            texto.see(tk.END)
+        janela.after(500, atualizar)
+
+    atualizar()
+    janela.mainloop()
+
+
+def sair_programa(icon: pystray.Icon, item: object = None) -> None:
+    global running
+    running = False
+    icon.stop()
+
+
+def iniciar_icone_tray() -> pystray.Icon:
+    imagem = Image.open(ICON_PATH)
+    menu = pystray.Menu(
+        pystray.MenuItem(
+            "Mostrar Log",
+            lambda icon, item: threading.Thread(
+                target=mostrar_janela_log, daemon=True
+            ).start(),
+        ),
+        pystray.MenuItem("Sair", sair_programa),
+    )
+    icon = pystray.Icon("monitor", imagem, "Monitor de Arquivos", menu)
+    threading.Thread(target=icon.run, daemon=True).start()
+    return icon
+
 def monitorar_pasta(origem: str, destino: str, intervalo: int, extensoes: Optional[List[str]]) -> None:
     logger = configurar_log(origem)
     arquivos_processados = carregar_hashes(origem)
     log_evento(logger, f"Iniciando monitoramento: {origem} -> {destino}")
 
-    while True:
+    while running:
         try:
             for nome_arquivo in os.listdir(origem):
                 if extensoes and not any(nome_arquivo.lower().endswith(ext) for ext in extensoes):
@@ -182,6 +248,7 @@ def carregar_configuracao(caminho: str) -> Dict[str, Any]:
 def executar_monitoramento() -> None:
     verificar_instancia_unica()
     try:
+        icon = iniciar_icone_tray()
         config = carregar_configuracao("configuracao.json")
         intervalo = config.get("segundos_intervalo_scan", 60)
         pastas = config.get("pastas_monitoradas", [])
@@ -196,9 +263,13 @@ def executar_monitoramento() -> None:
                 t.start()
                 threads.append(t)
 
-        while True:
+        while running:
             time.sleep(1)
     finally:
+        try:
+            icon.stop()
+        except Exception:
+            pass
         remover_arquivo_lock()
 
 if __name__ == "__main__":

@@ -1,10 +1,14 @@
 {
   "pastas_monitoradas": [
     {
-      "origem": "C:\\Users\\Jose\\Desktop\\origem",
-      "destino": "C:\\Users\\Jose\\Desktop\\destino",
+      "origem": "%USERPROFILE%\\Desktop\\origem",
+      "destino": "%USERPROFILE%\\Desktop\\destino",
       "extensoes": []
     }
   ],
-  "segundos_intervalo_scan": 90
+  "segundos_intervalo_scan": 90,
+  "algoritmo_hash": "sha256",
+  "permitir_symlinks": false,
+  "nivel_log": "INFO",
+  "log_no_console": true
 }

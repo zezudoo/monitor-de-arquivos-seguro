@@ -1,9 +1,15 @@
 {
+  "modo_monitoramento": "eventos",
+  "observer_polling": false,
+  "caminho_estado_sqlite": "hashes/estado.sqlite3",
+  "expirar_hashes_dias": 180,
   "pastas_monitoradas": [
     {
       "origem": "%USERPROFILE%\\Desktop\\origem",
       "destino": "%USERPROFILE%\\Desktop\\destino",
-      "extensoes": []
+      "extensoes": [],
+      "recursivo": false,
+      "politica_conflito_destino": "skip"
     }
   ],
   "segundos_intervalo_scan": 90,

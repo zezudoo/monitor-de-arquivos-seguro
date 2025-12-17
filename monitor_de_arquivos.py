@@ -5,6 +5,8 @@ import hashlib
 import json
 import logging
 import os
+import queue
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -34,11 +36,17 @@ class PastaMonitorada:
     origem: Path
     destino: Path
     extensoes: set[str] | None = None
+    recursivo: bool = False
+    politica_conflito_destino: str = "skip"
 
 
 @dataclass(frozen=True)
 class ConfigAplicacao:
     pastas: list[PastaMonitorada]
+    modo_monitoramento: str = "eventos"  # "eventos" (watchdog) ou "varredura"
+    observer_polling: bool = False
+    caminho_estado_sqlite: Path = PASTA_HASHES / "estado.sqlite3"
+    expirar_hashes_dias: int | None = 180
     intervalo_scan_s: int = 60
     algoritmo_hash: str = "sha256"
     tentativas_estabilidade: int = 3
@@ -111,6 +119,100 @@ def inicializar_pastas() -> None:
     PASTA_HASHES.mkdir(parents=True, exist_ok=True)
 
 
+class EstadoSqlite:
+    def __init__(self, caminho_db: Path, *, expirar_hashes_dias: int | None) -> None:
+        self.caminho_db = caminho_db
+        self.expirar_apos_s = None if expirar_hashes_dias is None else int(expirar_hashes_dias) * 86400
+        self._lock = threading.Lock()
+        self._ultimo_prune_ts = 0.0
+
+        self.caminho_db.parent.mkdir(parents=True, exist_ok=True)
+        self._con = sqlite3.connect(
+            str(self.caminho_db),
+            timeout=30,
+            check_same_thread=False,
+        )
+        self._con.execute("PRAGMA journal_mode=WAL;")
+        self._con.execute("PRAGMA synchronous=NORMAL;")
+        self._con.execute("PRAGMA foreign_keys=ON;")
+        self._con.execute("PRAGMA busy_timeout=5000;")
+        self._con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_hashes (
+                folder_id TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                first_seen_ts REAL NOT NULL,
+                last_seen_ts REAL NOT NULL,
+                PRIMARY KEY (folder_id, hash)
+            );
+            """
+        )
+        self._con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_processed_hashes_last_seen ON processed_hashes(last_seen_ts);"
+        )
+
+    def __enter__(self) -> "EstadoSqlite":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001
+        self.close()
+
+    def close(self) -> None:
+        try:
+            self._con.close()
+        except Exception:
+            pass
+
+    def importar_hashes(self, folder_id: str, hashes: dict[str, float]) -> int:
+        if not hashes:
+            return 0
+        with self._lock:
+            self._con.executemany(
+                """
+                INSERT INTO processed_hashes(folder_id, hash, first_seen_ts, last_seen_ts)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(folder_id, hash) DO UPDATE SET last_seen_ts=excluded.last_seen_ts;
+                """,
+                [(folder_id, h, ts, ts) for h, ts in hashes.items()],
+            )
+        return len(hashes)
+
+    def hash_ja_processado(self, folder_id: str, hash_arquivo: str, *, agora: float) -> bool:
+        with self._lock:
+            cur = self._con.execute(
+                "SELECT 1 FROM processed_hashes WHERE folder_id=? AND hash=? LIMIT 1;",
+                (folder_id, hash_arquivo),
+            )
+            existe = cur.fetchone() is not None
+            if existe:
+                self._con.execute(
+                    "UPDATE processed_hashes SET last_seen_ts=? WHERE folder_id=? AND hash=?;",
+                    (agora, folder_id, hash_arquivo),
+                )
+        return existe
+
+    def registrar_hash(self, folder_id: str, hash_arquivo: str, *, agora: float) -> None:
+        with self._lock:
+            self._con.execute(
+                """
+                INSERT INTO processed_hashes(folder_id, hash, first_seen_ts, last_seen_ts)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(folder_id, hash) DO UPDATE SET last_seen_ts=excluded.last_seen_ts;
+                """,
+                (folder_id, hash_arquivo, agora, agora),
+            )
+
+    def maybe_prune(self, *, agora: float, force: bool = False) -> None:
+        if self.expirar_apos_s is None:
+            return
+        if not force and (agora - self._ultimo_prune_ts) < 3600:
+            return
+        cutoff = agora - self.expirar_apos_s
+        with self._lock:
+            self._con.execute("DELETE FROM processed_hashes WHERE last_seen_ts < ?;", (cutoff,))
+        self._ultimo_prune_ts = agora
+
+
 def _identificador_pasta(pasta: Path) -> str:
     texto = str(pasta)
     digest = hashlib.sha256(texto.encode("utf-8", errors="replace")).hexdigest()[:12]
@@ -178,6 +280,21 @@ def salvar_hashes(pasta_origem: Path, dados: dict[str, float], logger: logging.L
             pass
 
 
+def migrar_hashes_json_para_sqlite(
+    pasta_origem: Path,
+    *,
+    folder_id: str,
+    logger: logging.Logger,
+    estado: EstadoSqlite,
+) -> None:
+    hashes = carregar_hashes(pasta_origem, logger)
+    if not hashes:
+        return
+    total = estado.importar_hashes(folder_id, hashes)
+    if total:
+        logger.info("Migrados %d hashes do JSON para o SQLite (%s)", total, estado.caminho_db.name)
+
+
 def configurar_log(pasta_origem: Path, config: ConfigAplicacao) -> logging.Logger:
     ident = _identificador_pasta(pasta_origem)
     logger = logging.getLogger(f"monitor.{ident}")
@@ -236,6 +353,48 @@ def _normalizar_extensoes(extensoes: Any) -> set[str] | None:
     return resultado or None
 
 
+def _normalizar_politica_conflito(valor: Any) -> str:
+    if valor is None:
+        return "skip"
+    if not isinstance(valor, str):
+        raise ValueError("politica_conflito_destino deve ser string")
+    texto = valor.strip().lower()
+    mapeamento = {
+        "skip": "skip",
+        "ignorar": "skip",
+        "ignore": "skip",
+        "rename": "rename",
+        "renomear": "rename",
+        "version": "version",
+        "versao": "version",
+        "versão": "version",
+        "versionar": "version",
+    }
+    if texto not in mapeamento:
+        raise ValueError(f"politica_conflito_destino inválida: {valor!r}")
+    return mapeamento[texto]
+
+
+def _normalizar_modo_monitoramento(valor: Any) -> str:
+    if valor is None:
+        return "eventos"
+    if not isinstance(valor, str):
+        raise ValueError("modo_monitoramento deve ser string")
+    texto = valor.strip().lower()
+    mapeamento = {
+        "eventos": "eventos",
+        "eventos_watchdog": "eventos",
+        "watchdog": "eventos",
+        "events": "eventos",
+        "varredura": "varredura",
+        "scan": "varredura",
+        "polling": "varredura",
+    }
+    if texto not in mapeamento:
+        raise ValueError(f"modo_monitoramento inválido: {valor!r}")
+    return mapeamento[texto]
+
+
 def _nivel_log(valor: Any) -> int:
     if valor is None:
         return logging.INFO
@@ -290,10 +449,36 @@ def _validar_caminho_windows(caminho: str, *, campo: str, idx: int) -> None:
         )
 
 
+def _caminho_esta_dentro_de(child: Path, parent: Path) -> bool:
+    try:
+        parent_s = os.path.normcase(os.path.abspath(str(parent)))
+        child_s = os.path.normcase(os.path.abspath(str(child)))
+        return os.path.commonpath([parent_s, child_s]) == parent_s
+    except ValueError:
+        return False
+
+
 def montar_config(dados: dict[str, Any], *, base_dir: Path, debug: bool = False) -> ConfigAplicacao:
     intervalo = int(dados.get("segundos_intervalo_scan", 60))
     if intervalo <= 0:
         raise ValueError("segundos_intervalo_scan deve ser > 0")
+
+    modo_monitoramento = _normalizar_modo_monitoramento(dados.get("modo_monitoramento"))
+    observer_polling = bool(dados.get("observer_polling", False))
+
+    expirar_hashes_dias = dados.get("expirar_hashes_dias", 180)
+    if expirar_hashes_dias is None:
+        expirar_hashes_dias_val: int | None = None
+    else:
+        expirar_hashes_dias_val = int(expirar_hashes_dias)
+        if expirar_hashes_dias_val <= 0:
+            raise ValueError("expirar_hashes_dias deve ser > 0 (ou null para desativar)")
+
+    caminho_estado_raw = dados.get("caminho_estado_sqlite", "hashes/estado.sqlite3")
+    caminho_estado_str = os.path.expandvars(str(caminho_estado_raw)).strip()
+    caminho_estado = Path(caminho_estado_str).expanduser()
+    if not caminho_estado.is_absolute():
+        caminho_estado = (base_dir / caminho_estado).resolve()
 
     algoritmo_hash = str(dados.get("algoritmo_hash", "sha256")).strip().lower()
     try:
@@ -337,7 +522,25 @@ def montar_config(dados: dict[str, Any], *, base_dir: Path, debug: bool = False)
             raise ValueError(f"pastas_monitoradas[{idx}] origem e destino não podem ser iguais")
 
         extensoes = _normalizar_extensoes(bloco.get("extensoes", []))
-        pastas.append(PastaMonitorada(origem=origem, destino=destino, extensoes=extensoes))
+        recursivo = bool(bloco.get("recursivo", False))
+        if recursivo and _caminho_esta_dentro_de(destino, origem):
+            raise ValueError(
+                f"pastas_monitoradas[{idx}] destino não pode ficar dentro da origem quando recursivo=true"
+            )
+
+        politica_conflito = _normalizar_politica_conflito(
+            bloco.get("politica_conflito_destino", dados.get("politica_conflito_destino"))
+        )
+
+        pastas.append(
+            PastaMonitorada(
+                origem=origem,
+                destino=destino,
+                extensoes=extensoes,
+                recursivo=recursivo,
+                politica_conflito_destino=politica_conflito,
+            )
+        )
 
     permitir_symlinks = bool(dados.get("permitir_symlinks", False))
     tentativas_estabilidade = int(dados.get("tentativas_estabilidade", 3))
@@ -358,6 +561,10 @@ def montar_config(dados: dict[str, Any], *, base_dir: Path, debug: bool = False)
 
     return ConfigAplicacao(
         pastas=pastas,
+        modo_monitoramento=modo_monitoramento,
+        observer_polling=observer_polling,
+        caminho_estado_sqlite=caminho_estado,
+        expirar_hashes_dias=expirar_hashes_dias_val,
         intervalo_scan_s=intervalo,
         algoritmo_hash=algoritmo_hash,
         tentativas_estabilidade=tentativas_estabilidade,
@@ -428,19 +635,55 @@ def _copiar_para_temp_e_calcular_hash(
         raise
 
 
+def _destino_incremental(destino_base: Path, contador: int) -> Path:
+    return destino_base.with_name(f"{destino_base.stem} ({contador}){destino_base.suffix}")
+
+
+def _destino_versionado(destino_base: Path, contador: int) -> Path:
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    sufixo = f"_{ts}" if contador == 0 else f"_{ts}_{contador}"
+    return destino_base.with_name(f"{destino_base.stem}{sufixo}{destino_base.suffix}")
+
+
+def _resolver_destino_final(destino_base: Path, *, politica: str) -> Path | None:
+    if not destino_base.exists():
+        return destino_base
+    if politica == "skip":
+        return None
+
+    max_tentativas = 1000
+    if politica == "rename":
+        for i in range(1, max_tentativas + 1):
+            candidato = _destino_incremental(destino_base, i)
+            if not candidato.exists():
+                return candidato
+        raise RuntimeError("não foi possível gerar nome de destino livre (rename)")
+
+    if politica == "version":
+        for i in range(0, max_tentativas + 1):
+            candidato = _destino_versionado(destino_base, i)
+            if not candidato.exists():
+                return candidato
+        raise RuntimeError("não foi possível gerar nome de destino livre (version)")
+
+    raise ValueError(f"política de conflito desconhecida: {politica!r}")
+
+
 def copiar_arquivo_seguro(
     *,
     arquivo: Path,
-    pasta_origem: Path,
-    destino: Path,
+    pasta: PastaMonitorada,
+    folder_id: str,
     logger: logging.Logger,
     config: ConfigAplicacao,
-    arquivos_processados: dict[str, float],
+    estado: EstadoSqlite,
     tentativas_falha: dict[str, int],
     arquivos_ignorados: dict[str, float],
 ) -> None:
     chave = str(arquivo)
     agora = time.time()
+
+    estado.maybe_prune(agora=agora)
 
     if chave in arquivos_ignorados and (agora - arquivos_ignorados[chave]) < config.tempo_ignorar_falha_s:
         return
@@ -452,9 +695,15 @@ def copiar_arquivo_seguro(
         arquivos_ignorados[chave] = agora
         return
 
-    destino_arquivo = destino / nome_arquivo
+    try:
+        rel_dir = arquivo.parent.relative_to(pasta.origem)
+    except ValueError:
+        logger.warning("Ignorando arquivo fora da origem: %s", arquivo)
+        return
 
-    if destino_arquivo.exists():
+    destino_dir = pasta.destino / rel_dir
+    destino_base = destino_dir / nome_arquivo
+    if destino_base.exists() and pasta.politica_conflito_destino == "skip":
         return
 
     if not arquivo_esta_estavel(
@@ -491,7 +740,7 @@ def copiar_arquivo_seguro(
     try:
         tmp_path, hash_arquivo = _copiar_para_temp_e_calcular_hash(
             arquivo,
-            destino,
+            destino_dir,
             algoritmo_hash=config.algoritmo_hash,
         )
 
@@ -503,23 +752,29 @@ def copiar_arquivo_seguro(
         if st_depois and (st_depois.st_size != st_antes.st_size or st_depois.st_mtime_ns != st_antes.st_mtime_ns):
             raise RuntimeError("arquivo mudou durante a cópia")
 
-        if hash_arquivo in arquivos_processados:
+        if estado.hash_ja_processado(folder_id, hash_arquivo, agora=time.time()):
             logger.info("Arquivo duplicado (hash já processado), ignorando: %s", arquivo.name)
             return
 
-        if destino_arquivo.exists():
-            logger.info("Arquivo já existe no destino, ignorando: %s", destino_arquivo.name)
+        destino_final = _resolver_destino_final(destino_base, politica=pasta.politica_conflito_destino)
+        if destino_final is None:
+            logger.info("Arquivo já existe no destino, ignorando: %s", destino_base.name)
             return
 
-        try:
-            tmp_path.rename(destino_arquivo)
-        except FileExistsError:
-            logger.info("Arquivo já existe no destino, ignorando: %s", destino_arquivo.name)
-            return
+        for _ in range(3):
+            try:
+                tmp_path.rename(destino_final)
+                break
+            except FileExistsError:
+                destino_final = _resolver_destino_final(destino_base, politica=pasta.politica_conflito_destino)
+                if destino_final is None:
+                    logger.info("Arquivo já existe no destino, ignorando: %s", destino_base.name)
+                    return
+        else:
+            raise RuntimeError(f"conflito ao renomear para o destino: {destino_final}")
 
-        arquivos_processados[hash_arquivo] = time.time()
-        salvar_hashes(pasta_origem, arquivos_processados, logger)
-        logger.info("Arquivo copiado com sucesso: %s", destino_arquivo.name)
+        estado.registrar_hash(folder_id, hash_arquivo, agora=time.time())
+        logger.info("Arquivo copiado com sucesso: %s", destino_final.name)
         tentativas_falha.pop(chave, None)
         arquivos_ignorados.pop(chave, None)
         tmp_path = None
@@ -549,9 +804,10 @@ def copiar_arquivo_seguro(
 def processar_pasta(
     pasta: PastaMonitorada,
     *,
+    folder_id: str,
     config: ConfigAplicacao,
     logger: logging.Logger,
-    arquivos_processados: dict[str, float],
+    estado: EstadoSqlite,
     tentativas_falha: dict[str, int],
     arquivos_ignorados: dict[str, float],
 ) -> None:
@@ -563,38 +819,44 @@ def processar_pasta(
         return
 
     try:
-        with os.scandir(pasta.origem) as it:
-            for entry in it:
-                if entry.is_dir(follow_symlinks=False):
-                    continue
+        dirs: list[Path] = [pasta.origem]
+        while dirs:
+            dir_atual = dirs.pop()
+            with os.scandir(dir_atual) as it:
+                for entry in it:
+                    if not config.permitir_symlinks and entry.is_symlink():
+                        logger.warning("Ignorando link simbólico: %s", entry.path)
+                        continue
 
-                if not config.permitir_symlinks and entry.is_symlink():
-                    logger.warning("Ignorando link simbólico: %s", entry.path)
-                    continue
+                    if entry.is_dir(follow_symlinks=config.permitir_symlinks):
+                        if pasta.recursivo:
+                            dirs.append(Path(entry.path))
+                        continue
 
-                if not entry.is_file(follow_symlinks=config.permitir_symlinks):
-                    continue
+                    if not entry.is_file(follow_symlinks=config.permitir_symlinks):
+                        continue
 
-                if pasta.extensoes and not entry.name.lower().endswith(tuple(pasta.extensoes)):
-                    continue
+                    if pasta.extensoes and not entry.name.lower().endswith(tuple(pasta.extensoes)):
+                        continue
 
-                copiar_arquivo_seguro(
-                    arquivo=Path(entry.path),
-                    pasta_origem=pasta.origem,
-                    destino=pasta.destino,
-                    logger=logger,
-                    config=config,
-                    arquivos_processados=arquivos_processados,
-                    tentativas_falha=tentativas_falha,
-                    arquivos_ignorados=arquivos_ignorados,
-                )
+                    copiar_arquivo_seguro(
+                        arquivo=Path(entry.path),
+                        pasta=pasta,
+                        folder_id=folder_id,
+                        logger=logger,
+                        config=config,
+                        estado=estado,
+                        tentativas_falha=tentativas_falha,
+                        arquivos_ignorados=arquivos_ignorados,
+                    )
     except Exception as exc:
         logger.warning("Erro ao listar/varrer a pasta %s: %s", pasta.origem, exc)
 
 
-def monitorar_pasta(pasta: PastaMonitorada, config: ConfigAplicacao) -> None:
+def monitorar_pasta(pasta: PastaMonitorada, config: ConfigAplicacao, estado: EstadoSqlite) -> None:
     logger = configurar_log(pasta.origem, config)
-    arquivos_processados = carregar_hashes(pasta.origem, logger)
+    folder_id = _identificador_pasta(pasta.origem)
+    migrar_hashes_json_para_sqlite(pasta.origem, folder_id=folder_id, logger=logger, estado=estado)
     tentativas_falha: dict[str, int] = {}
     arquivos_ignorados: dict[str, float] = {}
 
@@ -603,43 +865,225 @@ def monitorar_pasta(pasta: PastaMonitorada, config: ConfigAplicacao) -> None:
     while True:
         processar_pasta(
             pasta,
+            folder_id=folder_id,
             config=config,
             logger=logger,
-            arquivos_processados=arquivos_processados,
+            estado=estado,
             tentativas_falha=tentativas_falha,
             arquivos_ignorados=arquivos_ignorados,
         )
         time.sleep(config.intervalo_scan_s)
 
 
-def executar_monitoramento(config: ConfigAplicacao, *, once: bool = False) -> None:
-    inicializar_pastas()
+def _obter_watchdog(config: ConfigAplicacao) -> tuple[Any | None, Any | None]:
+    try:
+        from watchdog.events import FileSystemEventHandler  # type: ignore[import-not-found]
 
-    if once:
-        for pasta in config.pastas:
-            logger = configurar_log(pasta.origem, config)
-            arquivos_processados = carregar_hashes(pasta.origem, logger)
-            processar_pasta(
-                pasta,
-                config=config,
-                logger=logger,
-                arquivos_processados=arquivos_processados,
-                tentativas_falha={},
-                arquivos_ignorados={},
+        if config.observer_polling:
+            from watchdog.observers.polling import PollingObserver as Observer  # type: ignore[import-not-found]
+        else:
+            from watchdog.observers import Observer  # type: ignore[import-not-found]
+
+        return Observer, FileSystemEventHandler
+    except Exception:
+        return None, None
+
+
+class _FilaArquivos:
+    def __init__(self) -> None:
+        self._fila: queue.Queue[Path] = queue.Queue()
+        self._pendentes: set[Path] = set()
+        self._lock = threading.Lock()
+
+    def adicionar(self, caminho: Path) -> None:
+        with self._lock:
+            if caminho in self._pendentes:
+                return
+            self._pendentes.add(caminho)
+        self._fila.put(caminho)
+
+    def obter(self, *, timeout_s: float) -> Path | None:
+        try:
+            caminho = self._fila.get(timeout=timeout_s)
+        except queue.Empty:
+            return None
+        with self._lock:
+            self._pendentes.discard(caminho)
+        return caminho
+
+
+class _MonitorEventosPasta:
+    def __init__(self, pasta: PastaMonitorada, config: ConfigAplicacao, estado: EstadoSqlite) -> None:
+        self.pasta = pasta
+        self.config = config
+        self.estado = estado
+
+        self.logger = configurar_log(self.pasta.origem, self.config)
+        self.folder_id = _identificador_pasta(self.pasta.origem)
+        migrar_hashes_json_para_sqlite(self.pasta.origem, folder_id=self.folder_id, logger=self.logger, estado=self.estado)
+
+        self.tentativas_falha: dict[str, int] = {}
+        self.arquivos_ignorados: dict[str, float] = {}
+
+        self._stop = threading.Event()
+        self._fila = _FilaArquivos()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+
+    def iniciar(self) -> None:
+        self._thread.start()
+
+    def parar(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def enfileirar(self, caminho: str) -> None:
+        try:
+            p = Path(caminho)
+        except Exception:
+            return
+
+        if self.pasta.extensoes and not p.name.lower().endswith(tuple(self.pasta.extensoes)):
+            return
+
+        self._fila.adicionar(p)
+
+    def _worker(self) -> None:
+        self.logger.info("Iniciando monitoramento por eventos: %s -> %s", self.pasta.origem, self.pasta.destino)
+        while not self._stop.is_set():
+            caminho = self._fila.obter(timeout_s=0.5)
+            if caminho is None:
+                continue
+
+            try:
+                if not caminho.exists():
+                    continue
+                if not self.config.permitir_symlinks and caminho.is_symlink():
+                    continue
+                if not caminho.is_file():
+                    continue
+            except OSError:
+                continue
+
+            copiar_arquivo_seguro(
+                arquivo=caminho,
+                pasta=self.pasta,
+                folder_id=self.folder_id,
+                logger=self.logger,
+                config=self.config,
+                estado=self.estado,
+                tentativas_falha=self.tentativas_falha,
+                arquivos_ignorados=self.arquivos_ignorados,
             )
+
+
+def executar_monitoramento_eventos(config: ConfigAplicacao, *, estado: EstadoSqlite) -> None:
+    Observer, FileSystemEventHandler = _obter_watchdog(config)
+    if Observer is None or FileSystemEventHandler is None:
+        raise RuntimeError("watchdog não está disponível; instale com: pip install watchdog")
+
+    class Handler(FileSystemEventHandler):  # type: ignore[misc,valid-type]
+        def __init__(self, monitor: _MonitorEventosPasta) -> None:
+            super().__init__()
+            self._monitor = monitor
+
+        def on_created(self, event) -> None:  # noqa: ANN001
+            if not getattr(event, "is_directory", False):
+                self._monitor.enfileirar(getattr(event, "src_path", ""))
+
+        def on_modified(self, event) -> None:  # noqa: ANN001
+            if not getattr(event, "is_directory", False):
+                self._monitor.enfileirar(getattr(event, "src_path", ""))
+
+        def on_moved(self, event) -> None:  # noqa: ANN001
+            if not getattr(event, "is_directory", False):
+                self._monitor.enfileirar(getattr(event, "dest_path", ""))
+
+    observer = Observer()
+    monitores: list[_MonitorEventosPasta] = []
+
+    for pasta in config.pastas:
+        monitor = _MonitorEventosPasta(pasta, config, estado)
+
+        if not pasta.origem.exists():
+            monitor.logger.error("Pasta de origem não encontrada: %s", pasta.origem)
+            continue
+        if not pasta.origem.is_dir():
+            monitor.logger.error("Origem não é uma pasta: %s", pasta.origem)
+            continue
+
+        processar_pasta(
+            pasta,
+            folder_id=monitor.folder_id,
+            config=config,
+            logger=monitor.logger,
+            estado=estado,
+            tentativas_falha=monitor.tentativas_falha,
+            arquivos_ignorados=monitor.arquivos_ignorados,
+        )
+
+        monitor.iniciar()
+        monitores.append(monitor)
+
+        observer.schedule(Handler(monitor), str(pasta.origem), recursive=bool(pasta.recursivo))
+
+    if not monitores:
         return
 
-    threads: list[threading.Thread] = []
-    for pasta in config.pastas:
-        t = threading.Thread(target=monitorar_pasta, args=(pasta, config), daemon=True)
-        t.start()
-        threads.append(t)
-
+    observer.start()
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         return
+    finally:
+        observer.stop()
+        observer.join(timeout=5)
+        for monitor in monitores:
+            monitor.parar()
+
+
+def executar_monitoramento(config: ConfigAplicacao, *, once: bool = False) -> None:
+    inicializar_pastas()
+    with EstadoSqlite(
+        config.caminho_estado_sqlite,
+        expirar_hashes_dias=config.expirar_hashes_dias,
+    ) as estado:
+        estado.maybe_prune(agora=time.time(), force=True)
+
+        if once:
+            for pasta in config.pastas:
+                logger = configurar_log(pasta.origem, config)
+                folder_id = _identificador_pasta(pasta.origem)
+                migrar_hashes_json_para_sqlite(pasta.origem, folder_id=folder_id, logger=logger, estado=estado)
+                processar_pasta(
+                    pasta,
+                    folder_id=folder_id,
+                    config=config,
+                    logger=logger,
+                    estado=estado,
+                    tentativas_falha={},
+                    arquivos_ignorados={},
+                )
+            return
+
+        if config.modo_monitoramento == "eventos":
+            try:
+                executar_monitoramento_eventos(config, estado=estado)
+                return
+            except RuntimeError as exc:
+                print(f"[AVISO] {exc}. Caindo para modo varredura.", file=sys.stderr)
+
+        threads: list[threading.Thread] = []
+        for pasta in config.pastas:
+            t = threading.Thread(target=monitorar_pasta, args=(pasta, config, estado), daemon=True)
+            t.start()
+            threads.append(t)
+
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            return
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

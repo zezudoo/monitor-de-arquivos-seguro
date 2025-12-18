@@ -3,17 +3,18 @@
 Aplicação em Python para monitoramento de pastas no Windows e cópia segura de arquivos para uma pasta de destino.
 
 Modos de execução:
+
 - `eventos`: usa `watchdog` (baixa latência/CPU)
 - `varredura`: scan periódico (sem dependências externas)
 
 ## Requisitos
 
 - Python 3.10+
-- Para modo `eventos`: `pip install -r requirements.txt`
+- Dependências (CLI + GUI): `python -m pip install -r requirements.txt`
 
 ## Funcionalidades
 
-- Detecta arquivos novos/estáveis e copia de forma atômica (`.tmp` → rename)
+- Detecta arquivos novos/estáveis e copia de forma atômica (`.tmp` -> rename)
 - Verifica estabilidade do arquivo antes de copiar (tamanho + mtime)
 - Deduplicação por hash persistente em SQLite (`sha256` por padrão; configurável)
 - Expiração de hashes (configurável via `expirar_hashes_dias`)
@@ -28,6 +29,20 @@ Modos de execução:
 - Outro arquivo de config: `python monitor_de_arquivos.py --config .\\configuracao.json`
 - Uma única execução (útil para testes): `python monitor_de_arquivos.py --once`
 - Debug: `python monitor_de_arquivos.py --debug`
+
+## Interface gráfica (janela + bandeja)
+
+- Instale dependências: `python -m pip install -r requirements.txt`
+- Execute: `python monitor_gui.py`
+- A interface inicia/para o `monitor_de_arquivos.py` em segundo plano e exibe logs em tempo real.
+- Fechar a janela (X) minimiza para a bandeja; para encerrar totalmente use **Sair** no menu da bandeja.
+
+## Gerar executável (PyInstaller)
+
+- Gere a GUI: `pyinstaller monitor_gui.spec`
+- Gere o monitor (na mesma pasta da GUI): `pyinstaller --noconfirm --clean --onefile --distpath dist\\monitor_gui monitor_de_arquivos.py`
+- Rode sempre pelo `dist/monitor_gui/monitor_gui.exe` (não pelo `_internal`).
+- Ícones: `--icon monitor_icone.ico` define o ícone do arquivo `.exe`; a janela/bandeja preferem `monitor_icone.ico` ao lado do `.exe` (o `.spec` copia) e, se não achar, usam o ícone embutido no executável.
 
 ## Exemplo de configuracao.json
 
@@ -63,8 +78,8 @@ Modos de execução:
 
 ## Rede (caminho UNC)
 
-- Em JSON, para `\\phi\Fscoop\DPD\Jose` use `"\\\\phi\\Fscoop\\DPD\\Jose"` (4 barras no começo).
-- Alternativa: `"//phi/Fscoop/DPD/Jose"`.
+- Em JSON, para `\\SERVIDOR\COMPARTILHAMENTO\pasta` use `"\\\\SERVIDOR\\COMPARTILHAMENTO\\pasta"` (4 barras no começo).
+- Alternativa: `"//SERVIDOR/COMPARTILHAMENTO/pasta"`.
 - O usuário que executa o monitor precisa ter permissão no compartilhamento SMB; para serviços/Agendador, prefira UNC (evite drive mapeado).
 - Se o compartilhamento for instável para eventos, ative `observer_polling: true` ou use `modo_monitoramento: "varredura"`.
 

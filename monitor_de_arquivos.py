@@ -11,7 +11,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -112,6 +112,45 @@ class LockInstanciaUnica:
                 self.caminho.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def _processo_esta_ativo(pid: int) -> bool:
+    if pid <= 0:
+        return False
+
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return True
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == 5
+
+        try:
+            exit_code = wintypes.DWORD()
+            ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            if not ok:
+                return True
+            return int(exit_code.value) == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return True
 
 
 def inicializar_pastas() -> None:
@@ -976,7 +1015,12 @@ class _MonitorEventosPasta:
             )
 
 
-def executar_monitoramento_eventos(config: ConfigAplicacao, *, estado: EstadoSqlite) -> None:
+def executar_monitoramento_eventos(
+    config: ConfigAplicacao,
+    *,
+    estado: EstadoSqlite,
+    parent_pid: int | None = None,
+) -> None:
     Observer, FileSystemEventHandler = _obter_watchdog(config)
     if Observer is None or FileSystemEventHandler is None:
         raise RuntimeError("watchdog não está disponível; instale com: pip install watchdog")
@@ -1033,6 +1077,8 @@ def executar_monitoramento_eventos(config: ConfigAplicacao, *, estado: EstadoSql
     try:
         while True:
             time.sleep(1)
+            if parent_pid is not None and not _processo_esta_ativo(parent_pid):
+                break
     except KeyboardInterrupt:
         return
     finally:
@@ -1042,7 +1088,7 @@ def executar_monitoramento_eventos(config: ConfigAplicacao, *, estado: EstadoSql
             monitor.parar()
 
 
-def executar_monitoramento(config: ConfigAplicacao, *, once: bool = False) -> None:
+def executar_monitoramento(config: ConfigAplicacao, *, once: bool = False, parent_pid: int | None = None) -> None:
     inicializar_pastas()
     with EstadoSqlite(
         config.caminho_estado_sqlite,
@@ -1068,7 +1114,7 @@ def executar_monitoramento(config: ConfigAplicacao, *, once: bool = False) -> No
 
         if config.modo_monitoramento == "eventos":
             try:
-                executar_monitoramento_eventos(config, estado=estado)
+                executar_monitoramento_eventos(config, estado=estado, parent_pid=parent_pid)
                 return
             except RuntimeError as exc:
                 print(f"[AVISO] {exc}. Caindo para modo varredura.", file=sys.stderr)
@@ -1082,12 +1128,14 @@ def executar_monitoramento(config: ConfigAplicacao, *, once: bool = False) -> No
         try:
             while True:
                 time.sleep(1)
+                if parent_pid is not None and not _processo_esta_ativo(parent_pid):
+                    return
         except KeyboardInterrupt:
             return
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Monitor de Arquivos (cópia segura por varredura)")
+    parser = argparse.ArgumentParser(description="Monitor de Arquivos (eventos/varredura, cópia segura)")
     parser.add_argument(
         "--config",
         default=None,
@@ -1095,6 +1143,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--once", action="store_true", help="Executa uma varredura e encerra")
     parser.add_argument("--debug", action="store_true", help="Habilita logs em nível DEBUG")
+    parser.add_argument(
+        "--force-console",
+        action="store_true",
+        help="Força logs no console (útil para interface gráfica)",
+    )
+    parser.add_argument(
+        "--no-console",
+        action="store_true",
+        help="Desabilita logs no console (somente arquivo)",
+    )
+    parser.add_argument(
+        "--parent-pid",
+        type=int,
+        default=None,
+        help="Encerra automaticamente se o processo pai encerrar (usado pela GUI)",
+    )
     return parser.parse_args(argv)
 
 
@@ -1109,9 +1173,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Erro na configuração ({caminho_config}): {exc}", file=sys.stderr)
         return 2
 
+    if args.force_console and args.no_console:
+        print("Erro: use apenas um entre --force-console e --no-console", file=sys.stderr)
+        return 2
+    if args.force_console:
+        config = replace(config, log_no_console=True)
+    elif args.no_console:
+        config = replace(config, log_no_console=False)
+
     try:
         with LockInstanciaUnica(ARQUIVO_LOCK):
-            executar_monitoramento(config, once=bool(args.once))
+            executar_monitoramento(config, once=bool(args.once), parent_pid=args.parent_pid)
     except ErroInstanciaUnica as exc:
         print(str(exc), file=sys.stderr)
         return 1

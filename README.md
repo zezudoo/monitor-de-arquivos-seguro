@@ -1,5 +1,7 @@
 # Monitor de Arquivos
 
+Idioma: [English](README.en.md) | Português (Brasil)
+
 Aplicação em Python para monitoramento de pastas no Windows e cópia segura de arquivos para uma pasta de destino.
 
 Modos de execução:
@@ -44,7 +46,7 @@ Modos de execução:
 - Rode sempre pelo `dist/monitor_gui/monitor_gui.exe` (não pelo `_internal`).
 - Ícones: `--icon monitor_icone.ico` define o ícone do arquivo `.exe`; a janela/bandeja preferem `monitor_icone.ico` ao lado do `.exe` (o `.spec` copia) e, se não achar, usam o ícone embutido no executável.
 
-## Exemplo de configuracao.json
+## Exemplo de `configuracao.json`
 
 ```json
 {
